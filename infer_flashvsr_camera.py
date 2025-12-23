@@ -234,15 +234,23 @@ def main():
     
     frame_count = 0
     process_count = 0
+    error_count = 0
+    max_errors = 5  # 最大连续错误次数
+    fps_actual = 0  # 初始化 FPS
     
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
                 print(f"警告: 无法读取摄像头画面 (帧 {frame_count})")
+                error_count += 1
+                if error_count >= max_errors:
+                    print(f"错误: 连续 {max_errors} 次无法读取摄像头，程序退出")
+                    break
                 time.sleep(0.1)
                 continue
             
+            error_count = 0  # 重置错误计数
             frame_count += 1
             frame_buffer.append(frame.copy())
             
@@ -254,82 +262,121 @@ def main():
                 print(f"\n缓冲区已满 ({F} 帧), 开始处理...")
                 process_start = time.time()
                 
-                processed_frames = process_frame_batch(
-                    pipe, list(frame_buffer), args.scale, tH, tW, F,
-                    sparse_ratio=args.sparse_ratio, seed=0
-                )
-                
-                process_time = time.time() - process_start
-                process_count += 1
-                fps_actual = 1.0 / process_time if process_time > 0 else 0
-                
-                print(f"处理批次 {process_count}: {process_time:.2f}s ({fps_actual:.2f} FPS)")
-                
-                # 保存处理后的帧（取中间帧作为输出）
-                valid_frames = len(processed_frames) - 4
-                if valid_frames > 0:
-                    mid_idx = valid_frames // 2
-                    output_frame = processed_frames[mid_idx]
-                    output_frame_bgr = cv2.cvtColor(output_frame, cv2.COLOR_RGB2BGR)
-                    last_output_frame = output_frame_bgr
+                try:
+                    processed_frames = process_frame_batch(
+                        pipe, list(frame_buffer), args.scale, tH, tW, F,
+                        sparse_ratio=args.sparse_ratio, seed=0
+                    )
                     
-                    if args.save and video_writer:
-                        video_writer.write(output_frame_bgr)
-                
-                frame_buffer.clear()
+                    process_time = time.time() - process_start
+                    process_count += 1
+                    fps_actual = 1.0 / process_time if process_time > 0 else 0
+                    
+                    print(f"处理批次 {process_count}: {process_time:.2f}s ({fps_actual:.2f} FPS)")
+                    
+                    # 保存处理后的帧（取中间帧作为输出）
+                    valid_frames = len(processed_frames) - 4
+                    if valid_frames > 0:
+                        mid_idx = valid_frames // 2
+                        output_frame = processed_frames[mid_idx]
+                        output_frame_bgr = cv2.cvtColor(output_frame, cv2.COLOR_RGB2BGR)
+                        last_output_frame = output_frame_bgr
+                        
+                        if args.save and video_writer:
+                            video_writer.write(output_frame_bgr)
+                    
+                    frame_buffer.clear()
+                    
+                except RuntimeError as e:
+                    error_msg = str(e)
+                    if "out of memory" in error_msg.lower() or "cuda" in error_msg.lower():
+                        print(f"错误: GPU 显存不足 - {error_msg}")
+                        print("建议: 尝试减小 batch_size 或 scale 参数")
+                        torch.cuda.empty_cache()
+                        frame_buffer.clear()  # 清空缓冲区，重新开始
+                        error_count += 1
+                        if error_count >= max_errors:
+                            print(f"错误: 连续 {max_errors} 次处理失败，程序退出")
+                            break
+                    else:
+                        print(f"错误: 处理帧时发生运行时错误 - {error_msg}")
+                        traceback.print_exc()
+                        frame_buffer.clear()
+                        error_count += 1
+                        if error_count >= max_errors:
+                            print(f"错误: 连续 {max_errors} 次处理失败，程序退出")
+                            break
+                            
+                except Exception as e:
+                    print(f"错误: 处理帧时发生未知错误 - {type(e).__name__}: {e}")
+                    traceback.print_exc()
+                    frame_buffer.clear()
+                    error_count += 1
+                    if error_count >= max_errors:
+                        print(f"错误: 连续 {max_errors} 次处理失败，程序退出")
+                        break
             
             # 显示画面
             if args.display:
-                orig_display = cv2.resize(frame.copy(), (min(actual_width, 640), min(actual_height, 480)))
-                
-                if last_output_frame is not None:
-                    # 有处理结果：并排显示
-                    if tW > 1920 or tH > 1080:
-                        display_scale = min(1920/tW, 1080/tH)
-                        display_w = int(tW * display_scale)
-                        display_h = int(tH * display_scale)
-                        proc_display = cv2.resize(last_output_frame, (display_w, display_h))
+                try:
+                    orig_display = cv2.resize(frame.copy(), (min(actual_width, 640), min(actual_height, 480)))
+                    
+                    if last_output_frame is not None:
+                        # 有处理结果：并排显示
+                        if tW > 1920 or tH > 1080:
+                            display_scale = min(1920/tW, 1080/tH)
+                            display_w = int(tW * display_scale)
+                            display_h = int(tH * display_scale)
+                            proc_display = cv2.resize(last_output_frame, (display_w, display_h))
+                        else:
+                            proc_display = last_output_frame.copy()
+                        
+                        # 调整高度一致以便并排显示
+                        if orig_display.shape[0] != proc_display.shape[0]:
+                            h = min(orig_display.shape[0], proc_display.shape[0])
+                            orig_display = cv2.resize(orig_display, (int(orig_display.shape[1]*h/orig_display.shape[0]), h))
+                            proc_display = cv2.resize(proc_display, (int(proc_display.shape[1]*h/proc_display.shape[0]), h))
+                        
+                        combined = np.hstack([orig_display, proc_display])
+                        
+                        fps_display = fps_actual if process_count > 0 else 0
+                        info_text = f"Original | FlashVSR x{args.scale} | Batch: {process_count} | FPS: {fps_display:.1f}"
+                        cv2.putText(combined, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        cv2.putText(combined, "Press 'q' to quit, 's' to save", (10, combined.shape[0] - 20),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                        
+                        display_frame = combined
                     else:
-                        proc_display = last_output_frame.copy()
+                        # 没有处理结果：只显示原始画面
+                        display_frame = orig_display.copy()
+                        buffer_status = f"Buffer: {len(frame_buffer)}/{F}"
+                        status_text = f"Collecting frames... {buffer_status}" if len(frame_buffer) < F else "Processing..."
+                        cv2.putText(display_frame, status_text, (10, 30),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                        cv2.putText(display_frame, f"Frame: {frame_count}", (10, 60),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                        cv2.putText(display_frame, "Press 'q' to quit", (10, display_frame.shape[0] - 20),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
                     
-                    # 调整高度一致以便并排显示
-                    if orig_display.shape[0] != proc_display.shape[0]:
-                        h = min(orig_display.shape[0], proc_display.shape[0])
-                        orig_display = cv2.resize(orig_display, (int(orig_display.shape[1]*h/orig_display.shape[0]), h))
-                        proc_display = cv2.resize(proc_display, (int(proc_display.shape[1]*h/proc_display.shape[0]), h))
+                    cv2.imshow('FlashVSR Camera Processing', display_frame)
                     
-                    combined = np.hstack([orig_display, proc_display])
-                    
-                    fps_display = fps_actual if process_count > 0 else 0
-                    info_text = f"Original | FlashVSR x{args.scale} | Batch: {process_count} | FPS: {fps_display:.1f}"
-                    cv2.putText(combined, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.putText(combined, "Press 'q' to quit, 's' to save", (10, combined.shape[0] - 20),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                    
-                    display_frame = combined
-                else:
-                    # 没有处理结果：只显示原始画面
-                    display_frame = orig_display.copy()
-                    buffer_status = f"Buffer: {len(frame_buffer)}/{F}"
-                    status_text = f"Collecting frames... {buffer_status}" if len(frame_buffer) < F else "Processing..."
-                    cv2.putText(display_frame, status_text, (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                    cv2.putText(display_frame, f"Frame: {frame_count}", (10, 60),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                    cv2.putText(display_frame, "Press 'q' to quit", (10, display_frame.shape[0] - 20),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                
-                cv2.imshow('FlashVSR Camera Processing', display_frame)
-                
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    print("用户退出")
-                    break
-                elif key == ord('s') and last_output_frame is not None:
-                    save_path = f"./results/camera_frame_{frame_count}.jpg"
-                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                    cv2.imwrite(save_path, last_output_frame)
-                    print(f"已保存帧到: {save_path}")
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        print("用户退出")
+                        break
+                    elif key == ord('s') and last_output_frame is not None:
+                        try:
+                            save_path = f"./results/camera_frame_{frame_count}.jpg"
+                            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                            cv2.imwrite(save_path, last_output_frame)
+                            print(f"已保存帧到: {save_path}")
+                        except Exception as e:
+                            print(f"警告: 保存帧失败 - {e}")
+                            
+                except Exception as e:
+                    # 显示错误不影响主循环
+                    if frame_count % 30 == 0:  # 每30帧才打印一次，避免刷屏
+                        print(f"警告: 显示画面时出错 - {e}")
             
             # 定期清空显存缓存
             if frame_count % 10 == 0:
